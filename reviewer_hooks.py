@@ -30,6 +30,7 @@ _dialog: Optional[MCATDialog] = None
 _quiz_dialog: Optional[MCATQuizDialog] = None
 _quiz_prompt_dialog = None
 _addon_package: str = ""
+_quiz_in_flight: bool = False
 
 # Batched-quiz state (session-only)
 _quiz_in_flight: bool = False
