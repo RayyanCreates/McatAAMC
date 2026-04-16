@@ -1,0 +1,16 @@
+{
+    "api_provider": "anthropic",
+    "api_key": "",
+    "model": "claude-sonnet-4-6",
+    "hotkey": "Ctrl+M",
+    "button_label": "MCAT Q",
+    "show_button_in_reviewer": true,
+    "question_style": "auto",
+    "explanation_verbosity": "standard",
+    "show_topic_category": true,
+    "show_high_yield_takeaway": true,
+    "show_common_trap": true,
+    "preferred_fields": [],
+    "timeout_seconds": 45,
+    "max_tokens": 1800
+}

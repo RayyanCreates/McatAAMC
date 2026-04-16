@@ -1,0 +1,9 @@
+{
+    "package": "mcat_question_generator",
+    "name": "MCAT Question Generator",
+    "mod": 1744800000,
+    "min_point_version": 45,
+    "max_point_version": null,
+    "human_version": "1.0.0",
+    "conflicts": []
+}
