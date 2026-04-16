@@ -17,6 +17,7 @@ from .prompt_builder import build_prompt
 from .quiz_buffer import (
     QuizQuestion,
     add_reviewed_card,
+    get_buffer_size,
     get_and_reset_batch,
     scramble_answer_choices,
     scramble_question_order,
@@ -77,13 +78,20 @@ def setup(addon_package: str) -> None:
 
 
 def _on_reviewer_show_question(card) -> None:  # noqa: ANN001
+    """Reviewer-show hook: UI refresh only. Never triggers generation."""
     try:
         config = _load_config_safe()
         if not config.get("show_button_in_reviewer", True):
             return
         _inject_reviewer_button(config.get("button_label", "MCAT Q"), show_start_quiz=_quiz_ready)
+        get_logger().debug(
+            "Reviewer show hook ran (UI only). quiz_ready=%s quiz_pending=%s in_flight=%s",
+            _quiz_ready,
+            _quiz_pending,
+            _quiz_in_flight,
+        )
     except Exception:
-        get_logger().error(f"_on_reviewer_show_question error:\n{traceback.format_exc()}")
+        _safe_log_exception("_on_reviewer_show_question error")
 
 
 def _on_webview_message(handled, message: str, context) -> tuple:  # noqa: ANN001
@@ -99,9 +107,20 @@ def _on_webview_message(handled, message: str, context) -> tuple:  # noqa: ANN00
 def _on_reviewer_answer_card(reviewer, card, ease) -> None:  # noqa: ANN001
     """Count only answered cards; prepare one batched quiz at interval."""
     global _quiz_in_flight
+    logger = get_logger()
     try:
-        # Never regenerate while one batch is prepared/pending/in flight.
-        if _quiz_in_flight or _quiz_ready:
+        # Never regenerate while one batch is prepared/pending/in flight/open.
+        if _quiz_in_flight:
+            logger.info("Skipping generation: quiz generation already in flight")
+            return
+        if _quiz_ready:
+            logger.info("Skipping generation: quiz already ready")
+            return
+        if _quiz_pending:
+            logger.info("Skipping generation: quiz pending user start")
+            return
+        if _quiz_dialog is not None and _quiz_dialog.isVisible():
+            logger.info("Skipping generation: quiz dialog already open")
             return
 
         config = _load_config_safe()
@@ -110,29 +129,46 @@ def _on_reviewer_answer_card(reviewer, card, ease) -> None:  # noqa: ANN001
 
         card_data = get_card_data_from_card(card)
         if card_data is None:
+            logger.info("Skipping generation: answered card data unavailable")
             return
 
         should_trigger = add_reviewed_card(card_data, quiz_interval=quiz_interval)
+        current_count = get_buffer_size()
+        logger.info("Reviewed card counted: %s/%s", current_count, quiz_interval)
         if not should_trigger:
+            logger.info("Skipping generation: threshold not reached")
+            return
+
+        if current_count < max(1, quiz_interval):
+            logger.info("Skipping generation: buffer below threshold")
             return
 
         batch = get_and_reset_batch(batch_size=quiz_size)
         if not batch:
+            logger.info("Skipping generation: empty batch after threshold")
             return
 
         _quiz_in_flight = True
+        logger.info("Generating batched quiz for %s reviewed cards", len(batch))
         _start_batched_quiz(batch, config)
     except Exception:
         _quiz_in_flight = False
-        get_logger().error(f"_on_reviewer_answer_card error:\n{traceback.format_exc()}")
+        _safe_log_exception("_on_reviewer_answer_card error")
 
 
 def _start_batched_quiz(batch: List[dict], config: dict) -> None:
     """Cache-first, single API call for misses, then mark quiz ready."""
     global _quiz_in_flight
+    logger = get_logger()
     sources = [_card_to_source(c) for c in batch]
     cache_enabled = bool(config.get("cache_enabled", True))
     cached_map, misses = find_cached_questions(sources, enabled=cache_enabled)
+    logger.info(
+        "Quiz batch prepared: total_sources=%s cache_hits=%s cache_misses=%s",
+        len(sources),
+        len(cached_map),
+        len(misses),
+    )
 
     if not misses:
         questions = [cached_map[s["source_id"]] for s in sources if s["source_id"] in cached_map]
@@ -151,6 +187,7 @@ def _start_batched_quiz(batch: List[dict], config: dict) -> None:
                     merged.append(cached_map[sid])
                 elif sid in generated_map:
                     merged.append(generated_map[sid])
+            logger.info("Batched quiz generation complete: merged_questions=%s", len(merged))
             _set_quiz_ready(merged, config)
         finally:
             _quiz_in_flight = False
@@ -170,12 +207,14 @@ def _start_batched_quiz(batch: List[dict], config: dict) -> None:
 def _set_quiz_ready(questions: List[QuizQuestion], config: dict) -> None:
     global _quiz_ready, _quiz_pending, _quiz_prompt_shown, _prepared_quiz_questions
     if not questions:
+        get_logger().info("Skipping ready state: no quiz questions available")
         return
     prepared = _prepare_quiz_questions(questions, config)
     _prepared_quiz_questions = prepared
     _quiz_ready = True
     _quiz_pending = False
     _quiz_prompt_shown = False
+    get_logger().info("Quiz ready: question_count=%s", len(prepared))
     _inject_start_quiz_button_if_possible(config)
     _show_quiz_ready_prompt(len(prepared))
 
@@ -194,6 +233,7 @@ def _show_quiz_ready_prompt(question_count: int) -> None:
     """Small non-modal prompt: Start Quiz / Later."""
     global _quiz_prompt_dialog, _quiz_prompt_shown, _quiz_pending
     if _quiz_prompt_shown:
+        get_logger().info("Skipping prompt: already shown for current prepared batch")
         return
 
     from aqt.qt import QDialog, QHBoxLayout, QLabel, QPushButton, Qt, QVBoxLayout
@@ -226,11 +266,13 @@ def _show_quiz_ready_prompt(question_count: int) -> None:
 
     def on_start() -> None:
         dlg.close()
+        get_logger().info("Quiz prompt action: Start Quiz")
         _start_pending_quiz()
 
     def on_later() -> None:
         global _quiz_pending
         _quiz_pending = True
+        get_logger().info("Quiz prompt action: Later (quiz kept pending)")
         dlg.close()
 
     start_btn.clicked.connect(on_start)
@@ -238,6 +280,7 @@ def _show_quiz_ready_prompt(question_count: int) -> None:
 
     _quiz_prompt_dialog = dlg
     _quiz_prompt_shown = True
+    get_logger().info("Quiz prompt shown: Pop quiz ready (%s questions)", question_count)
     dlg.show()
     dlg.raise_()
 
@@ -245,6 +288,7 @@ def _show_quiz_ready_prompt(question_count: int) -> None:
 def _start_pending_quiz() -> None:
     global _quiz_ready, _quiz_pending, _quiz_prompt_shown, _prepared_quiz_questions, _quiz_dialog
     if not _quiz_ready or not _prepared_quiz_questions:
+        get_logger().info("Start quiz ignored: no prepared quiz is ready")
         return
 
     questions = list(_prepared_quiz_questions)
@@ -252,6 +296,7 @@ def _start_pending_quiz() -> None:
     _quiz_ready = False
     _quiz_pending = False
     _quiz_prompt_shown = False
+    get_logger().info("Starting prepared quiz with %s questions", len(questions))
 
     mw = aqt.mw
     if _quiz_dialog is None or not _quiz_dialog.isVisible():
