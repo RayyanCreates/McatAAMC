@@ -27,6 +27,7 @@ from .quiz_generator import generate_quiz
 
 _dialog: Optional[MCATDialog] = None
 _quiz_dialog: Optional[MCATQuizDialog] = None
+_quiz_prompt_dialog = None
 _addon_package: str = ""
 _quiz_in_flight: bool = False
 
@@ -36,6 +37,7 @@ _quiz_ready: bool = False
 _quiz_pending: bool = False
 _quiz_prompt_shown: bool = False
 _prepared_quiz_questions: List[QuizQuestion] = []
+
 
 def setup(addon_package: str) -> None:
     global _addon_package
@@ -79,7 +81,7 @@ def _on_reviewer_show_question(card) -> None:  # noqa: ANN001
         config = _load_config_safe()
         if not config.get("show_button_in_reviewer", True):
             return
-        _inject_reviewer_button(config.get("button_label", "MCAT Q"))
+        _inject_reviewer_button(config.get("button_label", "MCAT Q"), show_start_quiz=_quiz_ready)
     except Exception:
         get_logger().error(f"_on_reviewer_show_question error:\n{traceback.format_exc()}")
 
@@ -88,15 +90,20 @@ def _on_webview_message(handled, message: str, context) -> tuple:  # noqa: ANN00
     if message == "mcat_generate":
         trigger_generation()
         return (True, None)
+    if message == "mcat_start_quiz":
+        _start_pending_quiz()
+        return (True, None)
     return handled
 
 
 def _on_reviewer_answer_card(reviewer, card, ease) -> None:  # noqa: ANN001
-    """Count only answered cards; trigger one batched quiz at interval."""
+    """Count only answered cards; prepare one batched quiz at interval."""
     global _quiz_in_flight
     try:
-        if _quiz_in_flight:
+        # Never regenerate while one batch is prepared/pending/in flight.
+        if _quiz_in_flight or _quiz_ready:
             return
+
         config = _load_config_safe()
         quiz_interval = int(config.get("quiz_interval_count", 10))
         quiz_size = int(config.get("quiz_size", 10))
@@ -104,6 +111,7 @@ def _on_reviewer_answer_card(reviewer, card, ease) -> None:  # noqa: ANN001
         card_data = get_card_data_from_card(card)
         if card_data is None:
             return
+
         should_trigger = add_reviewed_card(card_data, quiz_interval=quiz_interval)
         if not should_trigger:
             return
@@ -120,7 +128,7 @@ def _on_reviewer_answer_card(reviewer, card, ease) -> None:  # noqa: ANN001
 
 
 def _start_batched_quiz(batch: List[dict], config: dict) -> None:
-    """Cache-first, single API call for misses, local quiz flow thereafter."""
+    """Cache-first, single API call for misses, then mark quiz ready."""
     global _quiz_in_flight
     sources = [_card_to_source(c) for c in batch]
     cache_enabled = bool(config.get("cache_enabled", True))
@@ -128,7 +136,7 @@ def _start_batched_quiz(batch: List[dict], config: dict) -> None:
 
     if not misses:
         questions = [cached_map[s["source_id"]] for s in sources if s["source_id"] in cached_map]
-        _show_quiz_questions(questions, config)
+        _set_quiz_ready(questions, config)
         _quiz_in_flight = False
         return
 
@@ -143,7 +151,7 @@ def _start_batched_quiz(batch: List[dict], config: dict) -> None:
                     merged.append(cached_map[sid])
                 elif sid in generated_map:
                     merged.append(generated_map[sid])
-            _show_quiz_questions(merged, config)
+            _set_quiz_ready(merged, config)
         finally:
             _quiz_in_flight = False
 
@@ -157,6 +165,108 @@ def _start_batched_quiz(batch: List[dict], config: dict) -> None:
             print(f"[MCAT QGen] Quiz generation failed: {message}", file=sys.stderr)
 
     generate_quiz(misses, config, on_result, on_error)
+
+
+def _set_quiz_ready(questions: List[QuizQuestion], config: dict) -> None:
+    global _quiz_ready, _quiz_pending, _quiz_prompt_shown, _prepared_quiz_questions
+    if not questions:
+        return
+    prepared = _prepare_quiz_questions(questions, config)
+    _prepared_quiz_questions = prepared
+    _quiz_ready = True
+    _quiz_pending = False
+    _quiz_prompt_shown = False
+    _inject_start_quiz_button_if_possible(config)
+    _show_quiz_ready_prompt(len(prepared))
+
+
+def _prepare_quiz_questions(questions: List[QuizQuestion], config: dict) -> List[QuizQuestion]:
+    prepared = list(questions)
+    if bool(config.get("scramble_answer_choices", True)):
+        for q in prepared:
+            scramble_answer_choices(q)
+    if bool(config.get("scramble_question_order", True)):
+        prepared = scramble_question_order(prepared)
+    return prepared
+
+
+def _show_quiz_ready_prompt(question_count: int) -> None:
+    """Small non-modal prompt: Start Quiz / Later."""
+    global _quiz_prompt_dialog, _quiz_prompt_shown, _quiz_pending
+    if _quiz_prompt_shown:
+        return
+
+    from aqt.qt import QDialog, QHBoxLayout, QLabel, QPushButton, Qt, QVBoxLayout
+
+    mw = aqt.mw
+    dlg = QDialog(mw)
+    dlg.setWindowTitle("MCAT Pop Quiz")
+    dlg.setModal(False)
+    dlg.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowCloseButtonHint)
+    dlg.setMinimumWidth(340)
+
+    layout = QVBoxLayout(dlg)
+    label = QLabel(f"Pop quiz ready ({question_count} questions) — Start now?")
+    label.setWordWrap(True)
+    label.setStyleSheet("font-size: 13px; color: #1a1a1a;")
+    layout.addWidget(label)
+
+    btn_row = QHBoxLayout()
+    start_btn = QPushButton("Start Quiz")
+    later_btn = QPushButton("Later")
+    start_btn.setStyleSheet(
+        "QPushButton { padding: 6px 14px; background-color: #2980b9; color: white; border: none; border-radius: 5px; }"
+    )
+    later_btn.setStyleSheet(
+        "QPushButton { padding: 6px 14px; background-color: #f4f6f7; color: #1f2d3a; border: 1px solid #d5d8dc; border-radius: 5px; }"
+    )
+    btn_row.addWidget(start_btn)
+    btn_row.addWidget(later_btn)
+    layout.addLayout(btn_row)
+
+    def on_start() -> None:
+        dlg.close()
+        _start_pending_quiz()
+
+    def on_later() -> None:
+        global _quiz_pending
+        _quiz_pending = True
+        dlg.close()
+
+    start_btn.clicked.connect(on_start)
+    later_btn.clicked.connect(on_later)
+
+    _quiz_prompt_dialog = dlg
+    _quiz_prompt_shown = True
+    dlg.show()
+    dlg.raise_()
+
+
+def _start_pending_quiz() -> None:
+    global _quiz_ready, _quiz_pending, _quiz_prompt_shown, _prepared_quiz_questions, _quiz_dialog
+    if not _quiz_ready or not _prepared_quiz_questions:
+        return
+
+    questions = list(_prepared_quiz_questions)
+    _prepared_quiz_questions = []
+    _quiz_ready = False
+    _quiz_pending = False
+    _quiz_prompt_shown = False
+
+    mw = aqt.mw
+    if _quiz_dialog is None or not _quiz_dialog.isVisible():
+        _quiz_dialog = MCATQuizDialog(parent=mw)
+    _quiz_dialog.load_quiz(questions)
+    _quiz_dialog.show()
+    _quiz_dialog.raise_()
+    _quiz_dialog.activateWindow()
+
+
+def _inject_start_quiz_button_if_possible(config: dict) -> None:
+    """Refresh reviewer buttons so pending quiz can be started later."""
+    if not config.get("show_button_in_reviewer", True):
+        return
+    _inject_reviewer_button(config.get("button_label", "MCAT Q"), show_start_quiz=_quiz_ready)
 
 
 def _card_to_source(card_data: dict) -> dict:
@@ -173,25 +283,6 @@ def _card_to_source(card_data: dict) -> dict:
         "source_preview": preview,
         "topic_category": note_type or deck,
     }
-
-
-def _show_quiz_questions(questions: List[QuizQuestion], config: dict) -> None:
-    global _quiz_dialog
-    if not questions:
-        return
-    if bool(config.get("scramble_answer_choices", True)):
-        for q in questions:
-            scramble_answer_choices(q)
-    if bool(config.get("scramble_question_order", True)):
-        questions = scramble_question_order(questions)
-
-    mw = aqt.mw
-    if _quiz_dialog is None or not _quiz_dialog.isVisible():
-        _quiz_dialog = MCATQuizDialog(parent=mw)
-    _quiz_dialog.load_quiz(questions)
-    _quiz_dialog.show()
-    _quiz_dialog.raise_()
-    _quiz_dialog.activateWindow()
 
 
 def trigger_generation() -> None:
@@ -249,13 +340,22 @@ def _on_regenerate() -> None:
     trigger_generation()
 
 
-def _inject_reviewer_button(label: str) -> None:
+def _inject_reviewer_button(label: str, show_start_quiz: bool = False) -> None:
     mw = aqt.mw
     safe_label = label.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"').replace("\n", "").replace("\r", "")
+    # Defensive state lookup so missing globals can never crash reviewer render.
+    quiz_ready_state = bool(globals().get("_quiz_ready", False))
+    quiz_pending_state = bool(globals().get("_quiz_pending", False))
+    start_quiz_visible = bool(show_start_quiz or quiz_ready_state or quiz_pending_state)
+    start_quiz_display = "block" if start_quiz_visible else "none"
+
     js = f"""
     (function() {{
         var old = document.getElementById('mcat-qgen-btn');
         if (old) {{ old.remove(); }}
+        var oldStart = document.getElementById('mcat-start-quiz-btn');
+        if (oldStart) {{ oldStart.remove(); }}
+
         var btn = document.createElement('button');
         btn.id = 'mcat-qgen-btn';
         btn.textContent = '{safe_label}';
@@ -292,11 +392,12 @@ def _inject_reviewer_button(label: str) -> None:
         if mw and mw.reviewer and hasattr(mw.reviewer, "web"):
             mw.reviewer.web.eval(js)
     except Exception:
-        get_logger().warning(f"_inject_reviewer_button: JS eval failed:\n{traceback.format_exc()}")
+        _safe_log_exception("_inject_reviewer_button: JS eval failed")
 
 
 def _setup_shortcut() -> None:
     from aqt.qt import QKeySequence, QShortcut
+
     mw = aqt.mw
     config = _load_config_safe()
     hotkey = str(config.get("hotkey", "Ctrl+M")).strip()
@@ -308,6 +409,7 @@ def _setup_shortcut() -> None:
 
 def _setup_menu() -> None:
     from aqt.qt import QAction
+
     mw = aqt.mw
     if mw is None:
         return
@@ -322,6 +424,7 @@ def _setup_menu() -> None:
 def _show_not_reviewing_error() -> None:
     try:
         from aqt.utils import showInfo
+
         showInfo("No card is currently being reviewed.", title="MCAT Question Generator")
     except Exception:
         print("[MCAT QGen] Not in review session.", file=sys.stderr)
@@ -330,7 +433,11 @@ def _show_not_reviewing_error() -> None:
 def _show_card_read_error() -> None:
     try:
         from aqt.utils import showWarning
-        showWarning("Could not read the current card's data. No data was modified.", title="MCAT Question Generator — Card Read Error")
+
+        showWarning(
+            "Could not read the current card's data. No data was modified.",
+            title="MCAT Question Generator — Card Read Error",
+        )
     except Exception:
         print("[MCAT QGen] Card read error.", file=sys.stderr)
 
@@ -339,7 +446,16 @@ def _load_config_safe() -> dict:
     try:
         return load_config(_addon_package)
     except Exception:
-        get_logger().error(f"_load_config_safe failed:\n{traceback.format_exc()}")
+        _safe_log_exception("_load_config_safe failed")
         from .config_manager import _DEFAULTS
 
         return dict(_DEFAULTS)
+
+
+def _safe_log_exception(message: str) -> None:
+    """Log defensively to avoid cascading failures in Anki's error handler."""
+    tb = traceback.format_exc()
+    try:
+        get_logger().error(f"{message}:\n{tb}")
+    except Exception:
+        print(f"[MCAT QGen] {message}:\n{tb}", file=sys.stderr)
