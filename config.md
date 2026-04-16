@@ -68,3 +68,35 @@ How long to wait for the API response before giving up.
 Maximum number of tokens in the generated response.
 - Default: `1800`
 - Reduce if you want shorter outputs; increase for more detailed explanations.
+
+## quiz_interval_count
+How many answered/reviewed cards trigger an automatic pop quiz.
+- Default: `10`
+
+## quiz_size
+How many questions to include in each pop quiz batch.
+- Default: `10`
+
+## scramble_question_order
+Shuffle generated questions locally before showing quiz.
+- Default: `true`
+
+## scramble_answer_choices
+Shuffle A/B/C/D answer order locally per question.
+- Default: `true`
+
+## quiz_max_tokens
+Token limit for a batched quiz generation request.
+- Default: `3200`
+
+## cache_enabled
+Enable local non-collection cache for reused/similar source concepts.
+- Default: `true`
+
+## generation_mode
+Cost/quality profile for quiz generation prompts.
+- `"cheap"` (default), `"balanced"`, `"rich"`
+
+## include_wrong_answer_rationales
+If true, asks model to include concise wrong-answer rationales per choice.
+- Default: `false` (more token-efficient)
