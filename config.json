@@ -12,5 +12,13 @@
     "show_common_trap": true,
     "preferred_fields": [],
     "timeout_seconds": 45,
-    "max_tokens": 1800
+    "max_tokens": 1800,
+    "quiz_interval_count": 10,
+    "quiz_size": 10,
+    "scramble_question_order": true,
+    "scramble_answer_choices": true,
+    "quiz_max_tokens": 3200,
+    "cache_enabled": true,
+    "generation_mode": "cheap",
+    "include_wrong_answer_rationales": false
 }

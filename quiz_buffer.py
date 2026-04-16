@@ -1,153 +1,107 @@
 """
-quiz_buffer.py — Session-only rolling buffer of recently reviewed cards.
+quiz_buffer.py — Session-only rolling buffer and quiz question utilities.
 
-Tracks the last N reviewed cards in memory and triggers a pop quiz when the
-batch is complete.  All state is ephemeral and session-scoped; nothing is
-written to the Anki collection.
-
-ARCHITECTURE NOTE:
-  The buffer is a plain module-level list.  add_reviewed_card() is called
-  from the reviewer_did_answer_card hook every time the user rates a card.
-  When the list reaches quiz_interval entries, the caller receives True,
-  should immediately call get_and_reset_batch(), and then start quiz generation.
-  The buffer is cleared atomically so no double-triggering can occur.
+Tracks only reviewed/answered cards (from reviewer context) and keeps an
+in-memory rolling buffer until quiz_interval is reached. Nothing in this module
+writes to Anki data structures.
 """
 
 from __future__ import annotations
 
 import random
-from typing import Any, Dict, List, Optional
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Deque, Dict, List, Optional
 
 
-# ---------------------------------------------------------------------------
-# QuizQuestion — central data object shared with quiz_generator and quiz_dialog
-# ---------------------------------------------------------------------------
-
+@dataclass
 class QuizQuestion:
-    """
-    One MCAT-style quiz question, generated from a source card concept.
+    """Structured quiz question used by local quiz flow and UI."""
 
-    Attributes populated at generation time (immutable after creation):
-        source_concept  short description of the card concept this came from
-        stem            question text (may include a brief scenario)
-        choices         {"A": text, "B": text, "C": text, "D": text}
-        correct_key     which key ("A"–"D") is the right answer
-        explanation     shown after submission; 2-3 sentences
-        topic           inferred MCAT topic, e.g. "Psych/Soc: Identity"
+    source_id: str
+    source_preview: str
+    question: str
+    choices: Dict[str, str]
+    correct_answer: str
+    explanation_correct: str
+    explanations_wrong: Dict[str, str] = field(default_factory=dict)
+    topic_category: str = ""
+    high_yield_takeaway: str = ""
 
-    Attributes written during quiz interaction:
-        selected_key    the choice the user clicked (None until selection)
-        submitted       True once the user hit "Submit Answer"
-    """
-
-    __slots__ = (
-        "source_concept", "stem", "choices", "correct_key",
-        "explanation", "topic", "selected_key", "submitted",
-    )
-
-    def __init__(
-        self,
-        source_concept: str,
-        stem: str,
-        choices: Dict[str, str],
-        correct_key: str,
-        explanation: str,
-        topic: str = "",
-    ) -> None:
-        self.source_concept: str = source_concept
-        self.stem: str = stem
-        self.choices: Dict[str, str] = choices
-        self.correct_key: str = correct_key
-        self.explanation: str = explanation
-        self.topic: str = topic
-        # Mutable interaction state
-        self.selected_key: Optional[str] = None
-        self.submitted: bool = False
+    # Local interaction state
+    selected_key: Optional[str] = None
+    submitted: bool = False
 
     @property
     def is_correct(self) -> bool:
-        """True when the user submitted the right answer."""
-        return self.submitted and self.selected_key == self.correct_key
+        return self.submitted and self.selected_key == self.correct_answer
 
 
-# ---------------------------------------------------------------------------
-# Session buffer state  (module-level, cleared per batch)
-# ---------------------------------------------------------------------------
-
-_buffer: List[Dict[str, Any]] = []
+_buffer: Deque[Dict[str, Any]] = deque()
 
 
 def add_reviewed_card(card_data: Dict[str, Any], quiz_interval: int = 10) -> bool:
-    """
-    Append a card data snapshot to the rolling buffer.
-
-    Returns True if the buffer has reached `quiz_interval` and a quiz should
-    now be triggered.  The caller must then call get_and_reset_batch() to
-    consume the batch and reset the counter atomically.
-
-    Args:
-        card_data:     read-only card dict from card_reader.get_card_data_from_card()
-        quiz_interval: cards between quizzes; read from add-on config
-
-    Returns:
-        True  — buffer full; call get_and_reset_batch() now
-        False — buffer not yet full; do nothing
-    """
+    """Append one answered card snapshot; return True when quiz should trigger."""
     if not card_data:
         return False
+    interval = max(1, int(quiz_interval or 10))
     _buffer.append(card_data)
-    return len(_buffer) >= max(1, quiz_interval)
+    # Keep only last `interval` cards, so we always quiz the latest window.
+    while len(_buffer) > interval:
+        _buffer.popleft()
+    return len(_buffer) >= interval
 
 
-def get_and_reset_batch() -> List[Dict[str, Any]]:
-    """
-    Return a copy of the current buffer and reset it to empty.
-    Call this immediately after add_reviewed_card() returns True.
-    Thread-safety note: Anki hooks run on the main Qt thread so there
-    is no concurrent access risk here.
-    """
+def get_and_reset_batch(batch_size: int = 10) -> List[Dict[str, Any]]:
+    """Get latest batch_size cards and reset buffer."""
     global _buffer
-    batch = list(_buffer)
-    _buffer = []
+    size = max(1, int(batch_size or 10))
+    batch = list(_buffer)[-size:]
+    _buffer.clear()
     return batch
 
 
 def get_buffer_size() -> int:
-    """Current number of cards waiting in the buffer."""
     return len(_buffer)
 
 
-# ---------------------------------------------------------------------------
-# Scrambling utilities
-# ---------------------------------------------------------------------------
-
 def scramble_question_order(questions: List[QuizQuestion]) -> List[QuizQuestion]:
-    """
-    Return a new list with the questions in a random order.
-    The input list is not mutated.
-    """
     shuffled = list(questions)
     random.shuffle(shuffled)
     return shuffled
 
 
 def scramble_answer_choices(question: QuizQuestion) -> None:
-    """
-    Shuffle the A-D choices of a single question in-place.
-    Updates correct_key to reflect the new position of the correct answer
-    so scoring remains accurate after scrambling.
-    """
+    """Shuffle A-D locally while preserving correct-answer mapping and rationales."""
     letters = ["A", "B", "C", "D"]
-    correct_text = question.choices.get(question.correct_key, "")
+    original_choices = {k: question.choices.get(k, "") for k in letters}
+    original_correct_key = question.correct_answer
+    original_correct_text = original_choices.get(original_correct_key, "")
 
-    # Collect, shuffle, reassign
-    texts = [question.choices.get(l, "") for l in letters]
-    random.shuffle(texts)
-    question.choices = {l: t for l, t in zip(letters, texts)}
+    items = [(k, original_choices[k]) for k in letters]
+    random.shuffle(items)
 
-    # Update correct_key to point to the new position of the correct text
-    for letter, text in question.choices.items():
-        if text == correct_text:
-            question.correct_key = letter
-            return
-    # Fallback: if exact match is lost (shouldn't happen), leave key unchanged
+    remapped: Dict[str, str] = {}
+    old_to_new: Dict[str, str] = {}
+    for idx, (old_key, text) in enumerate(items):
+        new_key = letters[idx]
+        remapped[new_key] = text
+        old_to_new[old_key] = new_key
+
+    question.choices = remapped
+
+    # Remap rationales keyed by choice letter.
+    new_wrong: Dict[str, str] = {}
+    for old_key, rationale in question.explanations_wrong.items():
+        if old_key in old_to_new:
+            new_wrong[old_to_new[old_key]] = rationale
+    question.explanations_wrong = new_wrong
+
+    # Recompute correct key.
+    question.correct_answer = old_to_new.get(original_correct_key, question.correct_answer)
+    if question.correct_answer not in question.choices:
+        # Fallback by matching text if key remap failed unexpectedly.
+        for key, text in question.choices.items():
+            if text == original_correct_text:
+                question.correct_answer = key
+                break
