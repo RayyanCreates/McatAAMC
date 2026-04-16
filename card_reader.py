@@ -119,6 +119,31 @@ def get_current_card_data() -> Optional[Dict[str, Any]]:
         return None
 
 
+
+
+def get_card_data_from_card(card) -> Optional[Dict[str, Any]]:
+    """Return read-only card metadata for a specific Card instance."""
+    logger = get_logger()
+    if card is None:
+        return None
+    try:
+        from aqt import mw
+        note = card.note()
+        if note is None:
+            return None
+        return {
+            "card_id": int(card.id),
+            "note_id": int(note.id),
+            "note_type_name": _safe_note_type_name(note),
+            "deck_name": _safe_deck_name(card, mw),
+            "fields": _safe_read_fields(note),
+            "tags": _safe_read_tags(note),
+            "template_name": _safe_template_name(card),
+        }
+    except Exception as exc:
+        logger.warning(f"get_card_data_from_card failed: {exc}")
+        return None
+
 # ---------------------------------------------------------------------------
 # Internal helpers — all read-only
 # ---------------------------------------------------------------------------
