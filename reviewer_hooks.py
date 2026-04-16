@@ -30,6 +30,12 @@ _quiz_dialog: Optional[MCATQuizDialog] = None
 _addon_package: str = ""
 _quiz_in_flight: bool = False
 
+# Batched-quiz state (session-only)
+_quiz_in_flight: bool = False
+_quiz_ready: bool = False
+_quiz_pending: bool = False
+_quiz_prompt_shown: bool = False
+_prepared_quiz_questions: List[QuizQuestion] = []
 
 def setup(addon_package: str) -> None:
     global _addon_package
@@ -266,6 +272,20 @@ def _inject_reviewer_button(label: str) -> None:
         btn.addEventListener('mouseleave', function() {{ btn.style.opacity = '0.92'; }});
         btn.addEventListener('click', function(e) {{ e.preventDefault(); e.stopPropagation(); pycmd('mcat_generate'); }});
         document.body.appendChild(btn);
+
+        var startBtn = document.createElement('button');
+        startBtn.id = 'mcat-start-quiz-btn';
+        startBtn.textContent = 'Start Quiz';
+        startBtn.title = 'Start pending MCAT pop quiz';
+        var s = [
+            'display: {start_quiz_display}','position: fixed','bottom: 60px','right: 22px','z-index: 99999',
+            'padding: 6px 13px','background: #16a085','color: #fff','border: none','border-radius: 6px',
+            'cursor: pointer','font-size: 12px','font-weight: bold',
+            'font-family: -apple-system, "Segoe UI", Arial, sans-serif','box-shadow: 0 2px 8px rgba(0,0,0,0.25)','opacity: 0.92'
+        ];
+        startBtn.style.cssText = s.join('; ');
+        startBtn.addEventListener('click', function(e) {{ e.preventDefault(); e.stopPropagation(); pycmd('mcat_start_quiz'); }});
+        document.body.appendChild(startBtn);
     }})();
     """
     try:
@@ -321,4 +341,5 @@ def _load_config_safe() -> dict:
     except Exception:
         get_logger().error(f"_load_config_safe failed:\n{traceback.format_exc()}")
         from .config_manager import _DEFAULTS
+
         return dict(_DEFAULTS)
